@@ -21,9 +21,6 @@ add_executable(download_enabler
 target_link_libraries(download_enabler
   SceIofilemgr_stub
   SceLibKernel_stub
-  SceHttp_stub_weak
-  SceSsl_stub_weak
-  SceSysmodule_stub_weak
   taiHEN_stub
 )
 
