@@ -16,8 +16,6 @@
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
-#include <psp2/photoexport.h>
-#include <psp2/sysmodule.h>
 #include <psp2/io/dirent.h>
 #include <psp2/io/fcntl.h>
 #include <psp2/kernel/clib.h>
@@ -25,59 +23,81 @@
 
 #include <taihen.h>
 
-static tai_hook_ref_t GetFileTypeRef;
-static tai_hook_ref_t sceSysmoduleLoadModuleInternalRef;
-static tai_hook_ref_t sceSysmoduleUnloadModuleInternalRef;
-static tai_hook_ref_t scePhotoExportFromFile2Ref;
+int sceIoPread(SceUID fd, void *data, SceSize size, SceOff offset);
+char *sceClibStrchr(const char *, int);
 
-static SceUID hooks[5];
+static tai_hook_ref_t ExportFileRef;
+static tai_hook_ref_t GetFileTypeRef;
+
+static SceUID hooks[3];
+
+static int ExportFilePatched(uint32_t *data) {
+	int res = TAI_CONTINUE(int, ExportFileRef, data);
+
+	if (res == 0x80101A09) {
+		char download_path[1024];
+		char bgdl_path[1024];
+		char file_name[256];
+		char short_name[256];
+		uint16_t url_length = 0;
+		uint32_t count = 0;
+
+		uint32_t num = *(uint32_t *)data[0];
+
+		sceClibSnprintf(bgdl_path, sizeof(bgdl_path)-1, "ux0:bgdl/t/%08x/d0.pdb", num);
+
+		SceUID fd = sceIoOpen(bgdl_path, SCE_O_RDONLY, 0);
+		if (fd < 0)
+			return fd;
+
+		sceIoPread(fd, &url_length, sizeof(uint16_t), 0xD6);
+		sceIoPread(fd, file_name, sizeof(file_name), 0xF7 + url_length);
+		sceIoClose(fd);
+
+		sceClibSnprintf(bgdl_path, sizeof(bgdl_path)-1, "ux0:bgdl/t/%08x/%s", num, file_name);
+
+		char *ext = sceClibStrchr(file_name, '.');
+		if (ext) {
+			int len = ext-file_name;
+			if (len > sizeof(short_name)-1)
+				len = sizeof(short_name)-1;
+			sceClibStrncpy(short_name, file_name, len);
+			short_name[len] = '\0';
+		} else {
+			sceClibStrncpy(short_name, file_name, sizeof(short_name));
+			ext = "";
+		}
+
+		while (1) {
+			if (count == 0)
+				sceClibSnprintf(download_path, sizeof(download_path)-1, "ux0:download/%s", file_name);
+			else
+				sceClibSnprintf(download_path, sizeof(download_path)-1, "ux0:download/%s (%d)%s", short_name, count, ext);
+
+			SceIoStat stat;
+			sceClibMemset(&stat, 0, sizeof(SceIoStat));
+			if (sceIoGetstat(download_path, &stat) < 0)
+				break;
+
+			count++;
+		}
+
+		res = sceIoMkdir("ux0:download", 0006);
+		if (res < 0 && res != 0x80010011)
+			return res;
+
+		return sceIoRename(bgdl_path, download_path);
+	}
+
+	return res;
+}
 
 static int GetFileTypePatched(int unk, int *type, char **filename, char **mime_type) {
 	int res = TAI_CONTINUE(int, GetFileTypeRef, unk, type, filename, mime_type);
 
-	if (res < 0) {
+	if (res == 0x80103A21) {
 		*type = 1; // Type photo
 		return 0;
-	}
-
-	return res;
-}
-
-static int scePhotoExportFromFile2Patched(const char *path, const PhotoExportParam *param, void *workingMemory, void *cancelCb, void *user, char *outPath, SceSize outPathSize) {
-	int res = TAI_CONTINUE(int, scePhotoExportFromFile2Ref, path, param, workingMemory, cancelCb, user, outPath, outPathSize);
-
-	if (res == 0x80101A09) {
-		char *p = sceClibStrrchr(path, '/');
-		if (p) {
-			sceIoMkdir("ux0:download", 0006);
-
-			char download_path[1024];
-			sceClibSnprintf(download_path, sizeof(download_path), "ux0:download/%s", p+1);
-
-			sceIoRemove(download_path);
-			return sceIoRename(path, download_path);
-		}
-	}
-
-	return res;
-}
-
-static int sceSysmoduleLoadModuleInternalPatched(SceUInt16 id) {
-	int res = TAI_CONTINUE(int, sceSysmoduleLoadModuleInternalRef, id);
-
-	if (res >= 0 && id == SCE_SYSMODULE_PHOTO_EXPORT) {
-		hooks[4] = taiHookFunctionImport(&scePhotoExportFromFile2Ref, "SceShell", 0x79166BD9, 0x76640642, scePhotoExportFromFile2Patched);
-	}
-
-	return res;
-}
-
-static int sceSysmoduleUnloadModuleInternalPatched(SceUInt16 id) {
-	int res = TAI_CONTINUE(int, sceSysmoduleUnloadModuleInternalRef, id);
-
-	if (res >= 0 && id == SCE_SYSMODULE_PHOTO_EXPORT) {
-		if (hooks[4] >= 0)
-			taiHookRelease(hooks[4], scePhotoExportFromFile2Ref);
 	}
 
 	return res;
@@ -92,16 +112,10 @@ int module_start(SceSize args, void *argp) {
 			case 0x0552F692: // retail 3.60 SceShell
 			{
 				hooks[0] = taiInjectData(info.modid, 0, 0x50A4A8, "GET", 4);
-				hooks[1] = taiHookFunctionOffset(&GetFileTypeRef, info.modid, 0, 0x11B5E4, 1, GetFileTypePatched);
+				hooks[1] = taiHookFunctionOffset(&ExportFileRef, info.modid, 0, 0x1163F6, 1, ExportFilePatched);
+				hooks[2] = taiHookFunctionOffset(&GetFileTypeRef, info.modid, 0, 0x11B5E4, 1, GetFileTypePatched);
 				break;
 			}
-		}
-
-		hooks[2] = taiHookFunctionImport(&sceSysmoduleLoadModuleInternalRef, "SceShell", 0x03FCF19D, 0x2399BF45, sceSysmoduleLoadModuleInternalPatched);
-		hooks[3] = taiHookFunctionImport(&sceSysmoduleUnloadModuleInternalRef, "SceShell", 0x03FCF19D, 0xFF206B19, sceSysmoduleUnloadModuleInternalPatched);
-
-		if (hooks[2] < 0 && hooks[3] < 0) {
-			hooks[4] = taiHookFunctionImport(&scePhotoExportFromFile2Ref, "SceShell", 0x79166BD9, 0x76640642, scePhotoExportFromFile2Patched);
 		}
 	}
 
@@ -109,14 +123,10 @@ int module_start(SceSize args, void *argp) {
 }
 
 int module_stop(SceSize args, void *argp) {
-	if (hooks[4] >= 0)
-		taiHookRelease(hooks[4], scePhotoExportFromFile2Ref);
-	if (hooks[3] >= 0)
-		taiHookRelease(hooks[3], sceSysmoduleUnloadModuleInternalRef);
 	if (hooks[2] >= 0)
-		taiHookRelease(hooks[2], sceSysmoduleLoadModuleInternalRef);
+		taiHookRelease(hooks[2], GetFileTypeRef);
 	if (hooks[1] >= 0)
-		taiHookRelease(hooks[1], GetFileTypeRef);
+		taiHookRelease(hooks[1], ExportFileRef);
 	if (hooks[0] >= 0)
 		taiInjectRelease(hooks[0]);
 
